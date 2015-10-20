@@ -1,11 +1,11 @@
-package elastic_journald
+package main
 
 import (
 	"bytes"
 	"encoding/json"
-	"flag"
 	"fmt"
 	"io/ioutil"
+	"log"
 	"os/exec"
 	"strings"
 	"time"
@@ -17,12 +17,13 @@ import (
 // #include <stdio.h>
 // #include <string.h>
 // #include <systemd/sd-journal.h>
-// #cgo LDFLAGS: -lsystemd
+// #cgo LDFLAGS: -lsystemd-journal
 import "C"
 
 type Config struct {
-	Hosts       elasticHostsType
-	IndexPrefix string
+	Host   string
+	Prefix string
+	State  string
 }
 
 type Service struct {
@@ -33,10 +34,11 @@ type Service struct {
 	Indexer *elastigo.BulkIndexer
 }
 
-func NewService() *Service {
+func NewService(host string, prefix string, state string) *Service {
 	config := &Config{
-		Hosts:       elasticHosts,
-		IndexPrefix: *elasticPrefix,
+		Host:   host,
+		Prefix: prefix,
+		State:	state,
 	}
 
 	elastic := elastigo.NewConn()
@@ -48,7 +50,7 @@ func NewService() *Service {
 		respJson, err := elastic.DoCommand("POST", "/_bulk", nil, buf)
 		if err != nil {
 			// TODO
-			panic(fmt.Sprintf("Bulk error: \n%v", err))
+			log.Fatalf("Bulk error: \n%v\n", err)
 		} else {
 			response := struct {
 				Took   int64 `json:"took"`
@@ -63,17 +65,16 @@ func NewService() *Service {
 			jsonErr := json.Unmarshal(respJson, &response)
 			if jsonErr != nil {
 				// TODO
-				panic(jsonErr)
+				log.Fatalln(jsonErr)
 			}
 			if response.Errors {
 				// TODO
-				fmt.Println(string(respJson))
-				panic("elasticsearch reported errors on intake")
+				log.Fatalf("elasticsearch reported errors on intake: %s\n", respJson)
 			}
 
 			messagesStored := len(response.Items)
 			lastStoredCursor := response.Items[messagesStored-1].Index.Id
-			ioutil.WriteFile(*elasticCursorFile, []byte(lastStoredCursor), 0644)
+			ioutil.WriteFile(config.State, []byte(lastStoredCursor), 0644)
 
 			// this will cause a busy loop, don't do it
 			// fmt.Printf("Sent %v entries\n", messagesStored)
@@ -90,7 +91,7 @@ func NewService() *Service {
 }
 
 func (s *Service) Run() {
-	s.Elastic.SetHosts(s.Config.Hosts)
+	s.Elastic.SetFromUrl(s.Config.Host)
 
 	s.InitJournal()
 	s.ProcessStream(GetFQDN())
@@ -103,12 +104,12 @@ func (s *Service) ProcessStream(hostname *string) {
 	for {
 		r := C.sd_journal_next(s.Journal)
 		if r < 0 {
-			panic(fmt.Sprintf("failed to iterate to next entry: %s", C.strerror(-r)))
+			log.Fatalf("failed to iterate to next entry: %s\n", C.strerror(-r))
 		}
 		if r == 0 {
 			r = C.sd_journal_wait(s.Journal, 1000000)
 			if r < 0 {
-				panic(fmt.Sprintf("failed to wait for changes: %s", C.strerror(-r)))
+				log.Fatalf("failed to wait for changes: %s\n", C.strerror(-r))
 			}
 			continue
 		}
@@ -120,35 +121,35 @@ func (s *Service) ProcessEntry(hostname *string) {
 	var realtime C.uint64_t
 	r := C.sd_journal_get_realtime_usec(s.Journal, &realtime)
 	if r < 0 {
-		panic(fmt.Sprintf("failed to get realtime timestamp: %s", C.strerror(-r)))
+		log.Fatalf("failed to get realtime timestamp: %s\n", C.strerror(-r))
 	}
 
 	var cursor *C.char
 	r = C.sd_journal_get_cursor(s.Journal, &cursor)
 	if r < 0 {
-		panic(fmt.Sprintf("failed to get cursor: %s", C.strerror(-r)))
+		log.Fatalf("failed to get cursor: %s\n", C.strerror(-r))
 	}
 
 	row := make(map[string]interface{})
 
 	timestamp := time.Unix(int64(realtime/1000000), int64(realtime%1000000)).UTC()
 
-	row["ts"] = timestamp.Format("2006-01-02T15:04:05Z")
-	row["host"] = hostname
+	row["timestamp"] = timestamp.Format("2006-01-02T15:04:05Z")
 	s.ProcessEntryFields(row)
 
 	message, _ := json.Marshal(row)
-	indexName := fmt.Sprintf("%v-%v", s.Config.IndexPrefix, timestamp.Format("2006-01-02"))
+	indexName := fmt.Sprintf("%v-%v", s.Config.Prefix, timestamp.Format("2006-01-02"))
 	cursorId := C.GoString(cursor)
 
 	s.Indexer.Index(
 		indexName,       // index
 		"journal",       // type
 		cursorId,        // id
+		"",              // parent
 		"",              // ttl
 		nil,             // date
 		string(message), // content
-		false)           // immediate index refresh
+	)
 }
 
 func (s *Service) ProcessEntryFields(row map[string]interface{}) {
@@ -163,31 +164,17 @@ func (s *Service) ProcessEntryFields(row map[string]interface{}) {
 		key := strings.ToLower(parts[0])
 		value := parts[1]
 
-		switch key {
-		// don't index bloat
-		case "_cap_effective":
-		case "_cmdline":
-		case "_exe":
-		case "_hostname":
-		case "_systemd_cgroup":
-		case "_systemd_slice":
-		case "_transport":
-		case "syslog_facility":
-		case "syslog_identifier":
-			continue
-		default:
-			row[strings.TrimPrefix(key, "_")] = value
-		}
+		row[strings.TrimPrefix(key, "_")] = value
 	}
 }
 
 func (s *Service) InitJournal() {
 	r := C.sd_journal_open(&s.Journal, C.SD_JOURNAL_LOCAL_ONLY)
 	if r < 0 {
-		panic(fmt.Sprintf("failed to open journal: %s", C.strerror(-r)))
+		log.Fatalf("failed to open journal: %s\n", C.strerror(-r))
 	}
 
-	bytes, err := ioutil.ReadFile(*elasticCursorFile)
+	bytes, err := ioutil.ReadFile(s.Config.State)
 	if err == nil {
 		s.Cursor = string(bytes)
 	}
@@ -195,11 +182,11 @@ func (s *Service) InitJournal() {
 	if s.Cursor != "" {
 		r = C.sd_journal_seek_cursor(s.Journal, C.CString(s.Cursor))
 		if r < 0 {
-			panic(fmt.Sprintf("failed to seek journal: %s", C.strerror(-r)))
+			log.Fatalf("failed to seek journal: %s\n", C.strerror(-r))
 		}
 		r = C.sd_journal_next_skip(s.Journal, 1)
 		if r < 0 {
-			panic(fmt.Sprintf("failed to skip current journal entry: %s", C.strerror(-r)))
+			log.Fatalf("failed to skip current journal entry: %s\n", C.strerror(-r))
 		}
 	}
 }
@@ -214,25 +201,4 @@ func GetFQDN() *string {
 	}
 	fqdn := string(bytes.TrimSpace(out.Bytes()))
 	return &fqdn
-}
-
-type elasticHostsType []string
-
-func (e *elasticHostsType) String() string {
-	return strings.Join(*e, ",")
-}
-
-func (e *elasticHostsType) Set(value string) error {
-	for _, host := range strings.Split(value, ",") {
-		*e = append(*e, host)
-	}
-	return nil
-}
-
-var elasticCursorFile = flag.String("cursor", ".elastic_journal_cursor", "The file to keep cursor state between runs")
-var elasticHosts elasticHostsType
-var elasticPrefix = flag.String("prefix", "journald", "The index prefix to use")
-
-func init() {
-	flag.Var(&elasticHosts, "hosts", "comma-separated list of elastic (target) hosts")
 }
