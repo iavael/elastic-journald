@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io/ioutil"
 	"log"
-	"os/exec"
 	"strings"
 	"time"
 	"unsafe"
@@ -94,10 +93,10 @@ func (s *Service) Run() {
 	s.Elastic.SetFromUrl(s.Config.Host)
 
 	s.InitJournal()
-	s.ProcessStream(GetFQDN())
+	s.ProcessStream()
 }
 
-func (s *Service) ProcessStream(hostname *string) {
+func (s *Service) ProcessStream() {
 	s.Indexer.Start()
 	defer s.Indexer.Stop()
 
@@ -113,11 +112,11 @@ func (s *Service) ProcessStream(hostname *string) {
 			}
 			continue
 		}
-		s.ProcessEntry(hostname)
+		s.ProcessEntry()
 	}
 }
 
-func (s *Service) ProcessEntry(hostname *string) {
+func (s *Service) ProcessEntry() {
 	var realtime C.uint64_t
 	r := C.sd_journal_get_realtime_usec(s.Journal, &realtime)
 	if r < 0 {
@@ -134,7 +133,7 @@ func (s *Service) ProcessEntry(hostname *string) {
 
 	timestamp := time.Unix(int64(realtime/1000000), int64(realtime%1000000)).UTC()
 
-	row["timestamp"] = timestamp.Format("2006-01-02T15:04:05Z")
+	row["timestamp"] = timestamp.Format("2006-01-02T15:04:05.999Z")
 	s.ProcessEntryFields(row)
 
 	message, _ := json.Marshal(row)
@@ -189,16 +188,4 @@ func (s *Service) InitJournal() {
 			log.Fatalf("failed to skip current journal entry: %s\n", C.strerror(-r))
 		}
 	}
-}
-
-func GetFQDN() *string {
-	cmd := exec.Command("hostname", "-f")
-	var out bytes.Buffer
-	cmd.Stdout = &out
-	err := cmd.Run()
-	if err != nil {
-		return nil
-	}
-	fqdn := string(bytes.TrimSpace(out.Bytes()))
-	return &fqdn
 }
